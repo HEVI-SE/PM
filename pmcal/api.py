@@ -6,6 +6,7 @@ om Polymarket ändrar något är det här filen som behöver justeras.
 import json
 import os
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -28,8 +29,13 @@ def get_json(url, params=None, cache=True, pause=0.15, retries=5):
             with urllib.request.urlopen(req, timeout=30) as r:
                 data = json.load(r)
             break
+        except urllib.error.HTTPError as e:
+            # Klientfel (4xx) blir inte bättre av att försöka igen, utom rate limit
+            if (400 <= e.code < 500 and e.code != 429) or attempt == retries - 1:
+                raise
+            time.sleep(2 ** attempt)
         except Exception:
-            # Rate limit eller nätverksfel: vänta och försök igen
+            # Nätverksfel: vänta och försök igen
             if attempt == retries - 1:
                 raise
             time.sleep(2 ** attempt)
@@ -74,15 +80,16 @@ def _parse_market(m, category=None):
     outcomes = _as_list(m.get("outcomes"))
     if len(prices) != 2 or len(tokens) != 2 or sorted(prices) != [0.0, 1.0]:
         return None  # ogiltiga, 50/50-avgjorda och flerutfallsmarknader hoppas över
-    end = parse_ts(m.get("closedTime")) or parse_ts(m.get("endDate"))
-    if not end:
+    # Handeln slutar vid det som kommer först av planerat slut och faktisk stängning
+    ends = [t for t in (parse_ts(m.get("endDate")), parse_ts(m.get("closedTime"))) if t]
+    if not ends:
         return None
     return {
         "id": m.get("id"),
         "question": m.get("question"),
         "slug": m.get("slug"),
         "category": category,
-        "end": end,
+        "end": min(ends),
         "tokens": tokens,
         "outcomes": outcomes,
         "result": prices,
@@ -90,48 +97,114 @@ def _parse_market(m, category=None):
     }
 
 
+def _iso(ts):
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _paged(url, params, consume, verbose, label, page):
+    """
+    Bläddrar bakåt i tiden med end_date_max istället för offset (API:t vägrar stora offset).
+    `consume(sida)` anropas en gång per sida och returnerar True så länge fler sidor behövs.
+    """
+    end_max, seen = int(time.time()), set()
+    while True:
+        try:
+            batch = get_json(url, {**params, "limit": page, "end_date_max": _iso(end_max),
+                                   "order": "endDate", "ascending": "false"}, cache=False)
+        except urllib.error.HTTPError as e:
+            print(f"  [{label}] API-fel {e.code}, avbryter hämtningen")
+            return
+        fresh = [b for b in batch if b.get("id") not in seen]
+        if not fresh:
+            return
+        seen.update(b.get("id") for b in fresh)
+        ends = [parse_ts(b.get("endDate")) for b in fresh]
+        ends = [t for t in ends if t]
+        if not ends:
+            return
+        if verbose:
+            print(f"  [{label}] sida med slutdatum {_iso(min(ends))[:10]} – {_iso(max(ends))[:10]}")
+        if not consume(fresh):
+            return
+        end_max = min(ends) if min(ends) < end_max else end_max - 1
+
+
 def fetch_markets(n=1000, contains=None, min_volume=0, page=500, verbose=True):
     """Avslutade binära marknader, nyast först, valfritt filtrerade på text i fråga/slug."""
-    out, offset = [], 0
     needle = contains.lower() if contains else None
-    while len(out) < n:
-        batch = get_json(f"{GAMMA}/markets", {
-            "closed": "true", "limit": page, "offset": offset,
-            "order": "endDate", "ascending": "false",
-        }, cache=False)
-        if not batch:
-            break
-        offset += page
+    out = []
+
+    def consume(batch):
         for m in batch:
             if needle and needle not in f"{m.get('question', '')} {m.get('slug', '')}".lower():
                 continue
             pm = _parse_market(m, category=contains)
             if pm and pm["volume"] >= min_volume:
                 out.append(pm)
-        if verbose:
-            print(f"  {len(out)} marknader (genomsökt {offset})")
+        return len(out) < n
+
+    _paged(f"{GAMMA}/markets", {"closed": "true"}, consume, verbose, contains or "alla", page)
+    if verbose:
+        print(f"  {len(out[:n])} marknader")
     return out[:n]
 
 
 def fetch_markets_by_tag(tag_slug, n=1000, min_volume=0, page=100, verbose=True):
-    """Avslutade binära marknader i en kategori, via events-endpointen (t.ex. 'politics', 'sports', 'crypto')."""
-    out, offset = [], 0
-    while len(out) < n:
-        events = get_json(f"{GAMMA}/events", {
-            "closed": "true", "tag_slug": tag_slug, "limit": page, "offset": offset,
-            "order": "endDate", "ascending": "false",
-        }, cache=False)
-        if not events:
-            break
-        offset += page
+    """Avslutade binära marknader i en kategori, via events-endpointen (t.ex. 'politics', 'sports')."""
+    out = []
+
+    def consume(events):
         for e in events:
             for m in e.get("markets", []):
                 pm = _parse_market(m, category=tag_slug)
                 if pm and pm["volume"] >= min_volume:
                     out.append(pm)
-        if verbose:
-            print(f"  [{tag_slug}] {len(out)} marknader (genomsökt {offset} events)")
+        return len(out) < n
+
+    _paged(f"{GAMMA}/events", {"closed": "true", "tag_slug": tag_slug}, consume, verbose, tag_slug, page)
+    if verbose:
+        print(f"  [{tag_slug}] {len(out[:n])} marknader")
     return out[:n]
+
+
+def fetch_updown(asset="btc", interval="5m", n=500, min_volume=0, verbose=True, max_misses=50):
+    """
+    Korta upp/ner-marknader hämtas direkt via slug, t.ex. 'btc-updown-5m-<starttid>',
+    där starttiden är en unix-tid jämnt delbar med intervallet. Kontrollera formatet i
+    adressfältet på polymarket.com om inget hittas.
+    """
+    step = parse_horizon(interval)
+    ts = (int(time.time()) // step - 2) * step  # senaste fönster som säkert är avgjort
+    out, misses, tried = [], 0, 0
+    while len(out) < n and misses < max_misses:
+        slug = f"{asset}-updown-{interval}-{ts}"
+        ts -= step
+        tried += 1
+        try:
+            res = get_json(f"{GAMMA}/markets", {"slug": slug})
+        except urllib.error.HTTPError:
+            res = []
+        pm = _parse_market(res[0], category=f"{asset} {interval}") if res else None
+        if pm and pm["volume"] >= min_volume:
+            out.append(pm)
+            misses = 0
+        else:
+            misses += 1
+        if verbose and tried % 50 == 0:
+            print(f"  [{asset} {interval}] {len(out)} marknader ({tried} fönster provade)")
+    if verbose:
+        print(f"  [{asset} {interval}] {len(out)} marknader")
+        if not out:
+            print(f"  Hittade inga marknader med slug '{asset}-updown-{interval}-<tid>'. "
+                  "Öppna en sådan marknad på polymarket.com och kolla adressen.")
+    return out
+
+
+def peek(**params):
+    """Visar några rader ur /markets som de ser ut, för felsökning."""
+    rows = get_json(f"{GAMMA}/markets", {"limit": 5, **params}, cache=False)
+    keep = ("id", "slug", "question", "endDate", "closedTime", "closed", "outcomePrices", "volumeNum")
+    return [{k: r.get(k) for k in keep} for r in rows]
 
 
 def price_before(token, end, horizon):
