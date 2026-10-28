@@ -16,6 +16,12 @@ jupyter lab notebooks/kalibrering.ipynb
 
 Börja med `N_MARKETS = 50` i notebooken för att se att hämtningen fungerar, och öka sedan.
 
+### Google Colab
+
+1. Öppna [colab.research.google.com](https://colab.research.google.com) → **GitHub**, kryssa i *Include private repos*.
+2. Välj repot `HEVI-SE/PM` och branchen `claude/hopeful-mccarthy-bkmowc`, och klicka på `notebooks/kalibrering.ipynb`.
+3. Colab hämtar bara notebooken, så setup-cellen klonar repot för att få med `pmcal/`. Eftersom repot är privat behövs en GitHub-token med läsrätt, sparad som Colab-secret med namnet `GITHUB_TOKEN` (nyckelikonen 🔑 i vänstermenyn, med *Notebook access* påslagen).
+
 ## Innehåll
 
 | Sökväg | Vad |
