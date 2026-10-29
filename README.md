@@ -42,6 +42,29 @@ python3 -m pytest -q
 - **edge** = positivt EV *och* hela 95 %-konfidensintervallet över priset. Lita bara på den kolumnen: i de billigaste intervallen ger slumpen ofta högt EV utan någon verklig fördel.
 - Notebooken delar också datan i äldre och nyare halva. En fördel som bara finns i den ena halvan är troligen slump.
 
+## Glidande medelvärde-regeln (`scripts/ma_regel.py`)
+
+Testar regeln "sälj när börsen stänger under sitt N-dagars medelvärde, köp när den stänger över, ligg i statsskuldväxlar däremellan" mot att bara behålla. Data hämtas från Yahoo: S&P 500 med utdelningar från 1988 (`^SP500TR`), prisindex från 1928 (`^GSPC`), och ränta från `^IRX` från 1960.
+
+```bash
+python3 scripts/ma_regel.py --start 1990 --kapital 10000 --avgift 0.05 --courtage 1
+python3 scripts/ma_regel.py --ma 30 --ma 200 --graf resultat.png
+python3 scripts/ma_regel.py --help
+```
+
+| Inställning | Betydelse |
+|---|---|
+| `--start` | Startår |
+| `--kapital` | Startkapital |
+| `--avgift` | Procent per affär (spread + procentuellt courtage) |
+| `--courtage` | Fast belopp per affär |
+| `--ma` | Medelvärde i dagar, kan anges flera gånger |
+| `--ticker` | Annat index, t.ex. `^OMX` |
+| `--samma-dag` | Handla på signalens stängning (optimistiskt). Standard är dagen efter. |
+| `--graf` | Spara en graf |
+
+Skriptet visar slutvärde, årlig avkastning, värsta fall, antal affärer, avgiften där regeln går jämnt upp, och resultatet per decennium.
+
 ## Begränsningar
 
 - **API-fälten är inte verifierade mot live-data än.** Koden bygger på hur Polymarkets publika API:er brukar svara. Om något fält har ändrats är det `pmcal/api.py` som ska justeras.
